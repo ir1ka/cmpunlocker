@@ -217,12 +217,12 @@ ok "NVIDIA driver ${detected} is supported"
 [[ -d "/lib/modules/$(uname -r)/build" ]] || die "Kernel headers missing for $(uname -r). Install linux-headers-$(uname -r) or kernel-devel."
 ok "Kernel headers present for $(uname -r)"
 
-info "Removing conflicting NVIDIA DKMS modules (not all systems have any)"
+info "Removing NVIDIA DKMS modules first"
 for ver in "${SUPPORTED_VERSIONS[@]}"; do
     dkms remove nvidia/"${ver}" --all 2>/dev/null || true
 done
 depmod -a "$(uname -r)"
-ok "DKMS conflicting modules resolution complete"
+ok "DKMS modules complete"
 
 step "Building and installing patched modules"
 chmod +x "${SCRIPT_DIR}/driver/build.sh"

@@ -6,14 +6,12 @@ mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_D
 DEFAULT_VERSION="${SUPPORTED_VERSIONS[0]:-}"
 VERSION="${CMPUNLOCKER_DRIVER_VERSION:-${DEFAULT_VERSION}}"
 PATCH_DIR="${SCRIPT_DIR}/patches"
-BUILD_ROOT="${CMPUNLOCKER_BUILD_DIR:-${SCRIPT_DIR}/.build}"
-SRC_NAME="open-gpu-kernel-modules-${VERSION}"
-SRC_DIR="${BUILD_ROOT}/${SRC_NAME}"
-TARBALL="${BUILD_ROOT}/${SRC_NAME}.tar.gz"
-TARBALL_URL="https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/${VERSION}.tar.gz"
 KVER="$(uname -r)"
-KSRC="/lib/modules/${KVER}/build"
-INSTALL_MOD_DIR="/lib/modules/${KVER}/updates/cmpunlocker"
+BUILD_ROOT="${CMPUNLOCKER_BUILD_DIR:-${SCRIPT_DIR}/.build}"
+WORK_DIR="${BUILD_ROOT}/patch-work"
+CMPUNLOCKER_DIR="/var/cmpunlocker"
+DKMS_SRC="/usr/src/nvidia-${VERSION}"
+SRC_BACKUP="${CMPUNLOCKER_DIR}/nvidia-${VERSION}"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -36,14 +34,21 @@ version_supported() {
 }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo ${SCRIPT_DIR}/build.sh"
+[[ ${#SUPPORTED_VERSIONS[@]} -gt 0 ]] || die "No supported versions listed in driver/VERSION"
 [[ -n "${VERSION}" ]] || die "No driver version set (driver/VERSION empty and CMPUNLOCKER_DRIVER_VERSION unset)"
 version_supported "${VERSION}" || die "Unsupported driver version '${VERSION}' (supported: ${SUPPORTED_VERSIONS[*]})"
 [[ -d "${PATCH_DIR}" ]] || die "Missing patches directory: ${PATCH_DIR}"
-[[ -d "${KSRC}" ]] || die "Kernel headers not found at ${KSRC}. Install linux-headers-${KVER} (or kernel-devel)."
 command -v python3 &>/dev/null || die "python3 is required to apply the card memory profile"
 python3 -c "import yaml" 2>/dev/null || die "python3 PyYAML is required to read common/constants.yaml (apt install python3-yaml)"
 command -v sha256sum &>/dev/null || die "sha256sum is required"
-info "Building against open-gpu-kernel-modules ${VERSION}"
+command -v dkms &>/dev/null || die "dkms is required (install the dkms package)"
+
+info "Target driver version: ${VERSION}"
+
+[[ -d "${DKMS_SRC}" ]] || die \
+    "DKMS source not found at ${DKMS_SRC}.
+     Install nvidia-open-dkms ${VERSION} so the source tree appears there."
+ok "DKMS source found: ${DKMS_SRC}"
 
 PATCH_ORDER=(
     sec2-postbl-plm-ss-cfg.patch
@@ -78,47 +83,64 @@ CONSTANTS="${SCRIPT_DIR}/../common/constants.yaml"
 CONSTANTS_ENV="$(python3 "${SCRIPT_DIR}/../tools/read-constants.py" "${CONSTANTS}" "${PATCH_DIR}" "${SCRIPT_DIR}/build.sh" "${PROFILE}")" || die "common/constants.yaml rejected (see error above)"
 eval "${CONSTANTS_ENV}"
 
-BUILD_STAMP="${VERSION}:${KVER}:${PROFILE}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+# ============================================================
+#  Build stamp  (detect whether re-patching is needed)
+# ============================================================
+
+BUILD_STAMP="${PROFILE}:${PATCH_HASH}:$(sha256sum "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+STAMP_FILE="${CMPUNLOCKER_DIR}/.cmpunlocker-stamp-${VERSION}"
 
 mkdir -p "${BUILD_ROOT}"
 
-if [[ ! -f "${TARBALL}" ]]; then
-    info "Downloading open-gpu-kernel-modules ${VERSION}..."
-    curl -L --fail -o "${TARBALL}.partial" "${TARBALL_URL}"
-    mv "${TARBALL}.partial" "${TARBALL}"
-    ok "Downloaded ${TARBALL}"
+# ============================================================
+#  1) Backup original DKMS source (one-time)
+# ============================================================
+
+if [[ ! -d "${SRC_BACKUP}" ]]; then
+    info "Backing up original DKMS source to ${SRC_BACKUP} ..."
+    mkdir -p "${CMPUNLOCKER_DIR}"
+    cp -a "${DKMS_SRC}" "${SRC_BACKUP}"
+    ok "Original source backed up"
 else
-    ok "Using cached tarball ${TARBALL}"
+    ok "Original backup already exists: ${SRC_BACKUP}"
 fi
 
-STAMP_FILE="${SRC_DIR}/.cmpunlocker-stamp"
-if [[ -d "${SRC_DIR}" ]] && [[ "$(cat "${STAMP_FILE}" 2>/dev/null || true)" == "${BUILD_STAMP}" ]]; then
-    SKIP_PREP=1
-    ok "Source tree already extracted and patched for this exact build; reusing it"
-else
-    SKIP_PREP=0
-    info "Extracting sources..."
-    rm -rf "${SRC_DIR}"
-    tar -xzf "${TARBALL}" -C "${BUILD_ROOT}"
-    if [[ ! -d "${SRC_DIR}" ]]; then
-        extracted="$(find "${BUILD_ROOT}" -maxdepth 1 -type d -name "${SRC_NAME}*" | head -1)"
-        [[ -n "${extracted}" ]] || die "Extracted source tree not found"
-        mv "${extracted}" "${SRC_DIR}"
-    fi
-    ok "Sources ready: ${SRC_DIR}"
+# ============================================================
+#  2) Patch source (skip if stamp matches)
+# ============================================================
 
-    info "Applying unlock patches..."
-    cd "${SRC_DIR}"
+SKIP_PATCH=0
+CURRENT_STAMP="$(cat "${STAMP_FILE}" 2>/dev/null || true)"
+if [[ "${CURRENT_STAMP}" == "${BUILD_STAMP}" ]] && grep -rqF 'CMP Gen2:' "${DKMS_SRC}" 2>/dev/null; then
+    SKIP_PATCH=1
+    ok "Build stamp matches -- source is already patched for this configuration"
+elif [[ "${CURRENT_STAMP}" == "${BUILD_STAMP}" ]]; then
+    info "Build stamp matches but the live DKMS tree lacks the patch (source was reset) -- re-patching"
+fi
+
+if [[ "${SKIP_PATCH}" -eq 0 ]]; then
+    # Copy original source into isolated work directory
+    info "Preparing work directory ..."
+    rm -rf "${WORK_DIR}"
+    mkdir -p "${WORK_DIR}"
+    cp -a "${SRC_BACKUP}/." "${WORK_DIR}/"
+    ok "Original source copied to work directory"
+
+    # Apply unlock patches
+    info "Applying unlock patches ..."
+    pushd "${WORK_DIR}"
     for i in "${!PATCH_ORDER[@]}"; do
         info "  ${PATCH_ORDER[$i]}"
         patch -p1 < "${PATCH_FILES[$i]}"
     done
     ok "All patches applied"
 
-    GSP_C="${SRC_DIR}/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
-    [[ -f "${GSP_C}" ]] || die "Missing ${GSP_C} after patching"
+    # Locate kernel_gsp.c (search to tolerate tree-layout differences)
+    GSP_C="$(find . -name kernel_gsp.c -path '*/gsp/*' | head -1)"
+    [[ -n "${GSP_C}" ]] || die "kernel_gsp.c not found in patched source tree"
 
-    info "Applying memory profile ${PROFILE} (${UNLOCK_LABEL} geometry)..."
+    # Apply memory profile geometry
+    info "Applying memory profile ${PROFILE} (${UNLOCK_LABEL} geometry) ..."
     if [[ "${SKIP_GEOMETRY_REWRITE}" -eq 1 ]]; then
         info "mixed profile: runtime device-id geometry (no build-time CFG1/LMR rewrite)"
     else
@@ -164,58 +186,66 @@ print(f"cfg1={cfg1} lmr={lmr} fb={fb} ({label})")
 PY
     fi
     ok "Memory profile ${PROFILE}: unlock_geometry=${UNLOCK_LABEL}"
+    popd
 
+    # Copy patched source back to the live DKMS directory
+    info "Copying patched source back to ${DKMS_SRC} ..."
+    cp -a "${WORK_DIR}/." "${DKMS_SRC}/"
+    find "${DKMS_SRC}" -name "*.sh" -exec chmod +x {} + 2>/dev/null || true
+    ok "Patched source installed"
+
+    # Verify critical patch landed in the live DKMS tree
+    if ! grep -rqF 'CMP Gen2:' "${DKMS_SRC}" 2>/dev/null; then
+        die "Verification failed: patched DKMS source at ${DKMS_SRC} does not contain the Gen2 probe-retrain strings. cp may have been blocked (e.g. immutable attribute or overlay fs). Run: sudo chattr -R -i ${DKMS_SRC} and retry."
+    fi
+    ok "Patched DKMS source verified"
+
+    # Clean up work directory
+    rm -rf "${WORK_DIR}"
+
+    # Save stamp so future runs can skip re-patching
     printf '%s\n' "${BUILD_STAMP}" > "${STAMP_FILE}"
+    ok "Build stamp saved"
 fi
 
-cd "${SRC_DIR}"
-mkdir -p "${INSTALL_MOD_DIR}"
-printf '%s\n' "${VERSION}" > "${INSTALL_MOD_DIR}/driver_version"
-printf '%s\n' "${PROFILE}" > "${INSTALL_MOD_DIR}/card_profile"
-printf '%s\n' "${UNLOCK_LABEL}" > "${INSTALL_MOD_DIR}/unlock_geometry"
+# ============================================================
+#  3) DKMS build + install
+# ============================================================
+
+info "Building via DKMS for kernel ${KVER} ..."
+dkms build -m nvidia -v "${VERSION}"
+ok "DKMS build complete"
+
+info "Installing via DKMS ..."
+dkms install -m nvidia -v "${VERSION}"
+ok "DKMS install complete"
+
+# ============================================================
+#  4) Write metadata (for verify.sh / remove.sh)
+# ============================================================
+
+mkdir -p "${CMPUNLOCKER_DIR}"
+printf '%s\n' "${VERSION}" > "${CMPUNLOCKER_DIR}/driver_version"
+printf '%s\n' "${PROFILE}" > "${CMPUNLOCKER_DIR}/card_profile"
+printf '%s\n' "${UNLOCK_LABEL}" > "${CMPUNLOCKER_DIR}/unlock_geometry"
 if [[ -n "${CMPUNLOCKER_GPU_INVENTORY:-}" ]]; then
-    printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${INSTALL_MOD_DIR}/gpu_inventory"
+    printf '%s\n' "${CMPUNLOCKER_GPU_INVENTORY}" > "${CMPUNLOCKER_DIR}/gpu_inventory"
     ok "Wrote gpu_inventory ($(echo "${CMPUNLOCKER_GPU_INVENTORY}" | grep -c . || true) GPU(s))"
 else
-    : > "${INSTALL_MOD_DIR}/gpu_inventory"
+    : > "${CMPUNLOCKER_DIR}/gpu_inventory"
 fi
 
-info "Building modules for kernel ${KVER}..."
-find . -name "*.sh" -exec chmod +x {} + 2>/dev/null || true
-if [[ "${SKIP_PREP}" -eq 0 ]]; then
-    rm -rf src/nvidia/_out src/nvidia-modeset/_out kernel-open/conftest 2>/dev/null || true
-else
-    info "Reusing prior build output — incremental rebuild"
-fi
-
-JOBS="$(nproc)"
-CC_CMD="gcc"
-if command -v ccache &>/dev/null; then
-    CC_CMD="ccache gcc"
-    info "ccache detected — compiler output will be cached for faster rebuilds"
-fi
-make -j"${JOBS}" modules SYSSRC="${KSRC}" CC="${CC_CMD}"
-ok "Modules built"
-if command -v ccache &>/dev/null; then
-    ccache -s 2>/dev/null | sed 's/^/  /' || true
-fi
-info "Installing modules to ${INSTALL_MOD_DIR}..."
-mkdir -p "${INSTALL_MOD_DIR}"
-
-mapfile -t KO_FILES < <(find "${SRC_DIR}" -type f \( \
-    -name 'nvidia.ko' -o -name 'nvidia-modeset.ko' -o -name 'nvidia-uvm.ko' \
-    -o -name 'nvidia-drm.ko' -o -name 'nvidia-peermem.ko' \) \
-    ! -path '*/conftest/*' | sort -u)
-[[ ${#KO_FILES[@]} -gt 0 ]] || die "No built nvidia*.ko found"
-
-for ko in "${KO_FILES[@]}"; do
-    base="$(basename "${ko}")"
-    install -m 0644 "${ko}" "${INSTALL_MOD_DIR}/${base}"
-    ok "Installed ${base}"
-done
+# ============================================================
+#  5) depmod
+# ============================================================
 
 depmod -a "${KVER}"
 ok "depmod complete"
+
+# ============================================================
+#  6) Rebuild initramfs
+# ============================================================
+
 rebuild_initramfs() {
     if command -v update-initramfs &>/dev/null; then
         info "Rebuilding initramfs (update-initramfs)..."
@@ -240,12 +270,14 @@ rebuild_initramfs() {
 }
 
 rebuild_initramfs || true
+
+# ============================================================
+#  7) Hot-reload modules (best-effort)
+# ============================================================
+
 resolved="$(modprobe -n -v nvidia 2>/dev/null | awk '/insmod/ {print $2; exit}' || true)"
 if [[ -n "${resolved}" ]]; then
     info "modprobe will load: ${resolved}"
-    if [[ "${resolved}" != *"/updates/cmpunlocker/"* ]]; then
-        warn "Resolved nvidia.ko is not under updates/cmpunlocker/"
-    fi
 fi
 info "Attempting to unload NVIDIA modules..."
 systemctl stop nvidia-persistenced 2>/dev/null || true
@@ -265,7 +297,10 @@ if ! grep -q '^nvidia ' /proc/modules; then
         reload_ok=1
         ok "Patched NVIDIA modules loaded"
         running_src="$(cat /sys/module/nvidia/srcversion 2>/dev/null || true)"
-        patched_src="$(modinfo -F srcversion "${INSTALL_MOD_DIR}/nvidia.ko" 2>/dev/null || true)"
+        dkms_dir="/lib/modules/${KVER}/updates/dkms"
+        installed_ko="${dkms_dir}/nvidia.ko.xz"
+        [[ -f "${installed_ko}" ]] || installed_ko="${dkms_dir}/nvidia.ko"
+        patched_src="$(modinfo -F srcversion "${installed_ko}" 2>/dev/null || true)"
         if [[ -n "${running_src}" && -n "${patched_src}" && "${running_src}" != "${patched_src}" ]]; then
             warn "Loaded nvidia srcversion (${running_src}) != patched (${patched_src})"
             reload_ok=0
