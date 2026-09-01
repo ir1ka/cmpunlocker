@@ -46,8 +46,7 @@ link_generation() {
 }
 
 install_service() {
-    local module
-    module="/lib/modules/$(uname -r)/updates/cmpunlocker/nvidia.ko"
+    local meta_dir="/var/cmpunlocker"
     local -a gpus=()
 
     require_root
@@ -61,13 +60,66 @@ install_service() {
     [[ ${#gpus[@]} -gt 0 ]] || die "No supported CMP 170HX found (10de:20c2 / 10de:2082)"
     info "Detected: ${gpus[*]}"
 
-    if [[ ! -f "${module}" ]]; then
-        die "Patched cmpunlocker module not found: ${module}"
+    # Read driver version from metadata to locate the DKMS source tree
+    local version
+    version="$(cat "${meta_dir}/driver_version" 2>/dev/null || true)"
+    if [[ -z "${version}" ]]; then
+        die "Cannot read driver version from ${meta_dir}/driver_version"
     fi
-    if ! grep -aFq 'CMP Gen2:' "${module}" 2>/dev/null; then
-        die "Installed module does not contain the Gen2 probe-retrain patch; refusing to arm a useless retrain service"
+
+    # --- Helper: search for 'CMP Gen2:' in various module forms ---
+    grep_module() {
+        local target="$1"
+        local keyword="CMP Gen2:"
+        if test -d "${target}"; then
+            grep -rFq "${keyword}" "${target}" && return 0
+        elif [[ "${target}" == *.xz ]]; then
+            command -v xzgrep >/dev/null || die "xz-utils (xzgrep) is required to inspect the compressed module ${target}"
+            xzgrep -aFq "${keyword}" "${target}" && return 0
+        else
+            grep -aFq "${keyword}" "${target}" && return 0
+        fi
+        return 1
+    }
+
+    # 1) DKMS source tree
+    local dkms_src="/usr/src/nvidia-${version}"
+    if [[ -d "${dkms_src}" ]]; then
+        if grep_module "${dkms_src}"; then
+            ok "DKMS source (${dkms_src}) contains the Gen2 probe-retrain patch"
+        else
+            die "DKMS source (${dkms_src}) does not contain the Gen2 probe-retrain patch"
+        fi
+    else
+        warn "DKMS source (${dkms_src}) not found"
     fi
-    ok "Installed NVIDIA module contains the Gen2 probe-retrain patch"
+
+    # 2) DKMS build tree (uncompressed .ko)
+    local build_ko
+    build_ko="$(find "/var/lib/dkms/nvidia/${version}" \
+        \( -name 'nvidia.ko' -o -name 'nvidia.ko.xz' \) 2>/dev/null | head -1 || true)"
+    if [[ -n "${build_ko}" ]]; then
+        if grep_module "${build_ko}"; then
+            ok "DKMS build module (${build_ko}) contains the Gen2 probe-retrain patch"
+        else
+            die "DKMS build module (${build_ko}) does not contain the Gen2 probe-retrain patch"
+        fi
+    else
+        warn "DKMS build module (nvidia.ko) not found"
+    fi
+
+    # 3) DKMS installs modules to updates/dkms/ (possibly xz-compressed)
+    local module
+    module="$(find "/lib/modules/$(uname -r)/updates/dkms" -maxdepth 1 \
+        \( -name 'nvidia.ko' -o -name 'nvidia.ko.xz' \) 2>/dev/null | head -1 || true)"
+    if [[ -z "${module}" ]]; then
+        die "Patched cmpunlocker module not found in /lib/modules/$(uname -r)/updates/dkms/"
+    fi
+    if grep_module "${module}"; then
+        ok "Installed module (${module}) contains the Gen2 probe-retrain patch"
+    else
+        die "Installed module (${module}) does not contain the Gen2 probe-retrain patch; refusing to arm a useless retrain service"
+    fi
 
     install -m 0755 "${HAMMER_SOURCE}" "${HAMMER_TARGET}"
     install -m 0644 "${SERVICE_SOURCE}" "${SERVICE_TARGET}"

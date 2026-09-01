@@ -3,10 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_NAME="cmpunlocker"
+CMPUNLOCKER_DIR="/var/cmpunlocker"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INSTALL_DIR="/opt/cmpunlocker"
 PASSTHROUGH_LIB="/usr/local/lib/cmpunlocker"
-mapfile -t SUPPORTED_VERSIONS < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' "${SCRIPT_DIR}/driver/VERSION" 2>/dev/null || true)
 
 source "${SCRIPT_DIR}/common/lib.sh"
 
@@ -15,7 +15,6 @@ banner
 if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
     warn "This removes cmpunlocker patched kernel modules:"
     echo "  - Stops cmpunlocker systemd service"
-    echo "  - Removes /lib/modules/*/updates/cmpunlocker/"
     echo "  - Removes ${INSTALL_DIR} (legacy install dir, if present)"
     echo "  - Removes cmpretrain service / modprobe Gen2 helpers"
     echo "  - Removes VM passthrough helpers (service, udev rule, vfio modprobe conf)"
@@ -112,61 +111,66 @@ else
     warn "No IOMMU config backup found — kernel command line left as-is"
 fi
 
-step "Removing patched modules and restoring stock NVIDIA modules"
-restore_stock_modules() {
-    local kernel="$1" ver
-    if modprobe -n -q -S "${kernel}" nvidia 2>/dev/null; then
-        ok "Stock nvidia module present for kernel ${kernel}: $(modinfo -n -k "${kernel}" nvidia 2>/dev/null || true)"
-        return 0
+step "Removing patched modules, DKMS cleanup, and restoring original source"
+
+if [ -e "${CMPUNLOCKER_DIR}" ]; then
+    # Read driver versions from metadata
+    REMOVED_VERSIONS=()
+    if [[ -f "${CMPUNLOCKER_DIR}/driver_version" ]]; then
+        REMOVED_VERSIONS+=("$(cat "${CMPUNLOCKER_DIR}/driver_version")")
     fi
-    if ! command -v dkms &>/dev/null; then
-        warn "No nvidia module for kernel ${kernel} and dkms is not installed — reinstall your distro's nvidia driver package"
-        return 0
+
+    # Remove patched modules via DKMS
+    if command -v dkms &>/dev/null; then
+        for ver in "${REMOVED_VERSIONS[@]}"; do
+            info "dkms remove nvidia/${ver} --all"
+            dkms remove -m nvidia -v "${ver}" --all 2>/dev/null || true
+            ok "DKMS modules removed for nvidia/${ver}"
+        done
     fi
-    for ver in "${SUPPORTED_VERSIONS[@]}"; do
-        [[ -f "/usr/src/nvidia-${ver}/dkms.conf" ]] || continue
-        info "Rebuilding stock nvidia ${ver} DKMS modules for kernel ${kernel} (install.sh removed them)..."
-        if dkms install "nvidia/${ver}" -k "${kernel}"; then
-            ok "Stock nvidia ${ver} modules restored for kernel ${kernel}"
-            return 0
+
+    # Restore original DKMS source from backup
+    for ver in "${REMOVED_VERSIONS[@]}"; do
+        backup="${CMPUNLOCKER_DIR}/nvidia-${ver}"
+        src="/usr/src/nvidia-${ver}"
+        if [[ -d "${backup}" ]]; then
+            info "Restoring original DKMS source from ${backup} ..."
+            rm -rf "${src}"
+            cp -a "${backup}" "${src}"
+            ok "Original DKMS source restored for nvidia-${ver}"
+
+            # Rebuild stock modules via DKMS
+            if command -v dkms &>/dev/null; then
+                info "Rebuilding stock nvidia/${ver} via DKMS ..."
+                dkms build -m nvidia -v "${ver}" 2>/dev/null || true
+                dkms install -m nvidia -v "${ver}" 2>/dev/null || true
+                ok "Stock DKMS modules rebuilt for nvidia/${ver}"
+            fi
+
+            # Clean up backup
+            rm -rf "${backup}"
+            ok "Backup removed: ${backup}"
+        else
+            warn "No backup found at ${backup} — source not restored"
         fi
-        warn "dkms install nvidia/${ver} failed for kernel ${kernel}"
+        rm -f "${CMPUNLOCKER_DIR}/.cmpunlocker-stamp-${ver}"
     done
-    warn "No stock nvidia DKMS source found for kernel ${kernel} — reinstall your distro's nvidia driver package"
-    return 0
-}
 
-mod_removed=0
-kernels=("$(uname -r)")
-shopt -s nullglob
-for mod_dir in /lib/modules/*/updates/cmpunlocker; do
-    if [[ -d "${mod_dir}" ]]; then
-        kernel="$(basename "$(dirname "$(dirname "${mod_dir}")")")"
-        rm -rf "${mod_dir}"
-        ok "Removed patched modules for kernel ${kernel}"
-        mod_removed=$((mod_removed + 1))
-        [[ " ${kernels[*]} " == *" ${kernel} "* ]] || kernels+=("${kernel}")
-    fi
-done
-[[ "${mod_removed}" -gt 0 ]] || warn "No patched kernel modules found"
+    rm -rf "${CMPUNLOCKER_DIR}"
+    ok "Removed cmpunlocker config"
 
-for kernel in "${kernels[@]}"; do
-    depmod -a "${kernel}" 2>/dev/null || true
-    restore_stock_modules "${kernel}"
-done
-
-info "Rebuilding initramfs so stock modules are packed again..."
-for kernel in "${kernels[@]}"; do
+    # Rebuild initramfs
     if command -v update-initramfs &>/dev/null; then
-        update-initramfs -u -k "${kernel}" 2>/dev/null || true
+        update-initramfs -u -k all 2>/dev/null || true
     elif command -v dracut &>/dev/null; then
-        dracut --force --kver "${kernel}" 2>/dev/null || true
+        dracut --force --regenerate-all 2>/dev/null || true
+    elif command -v mkinitcpio &>/dev/null; then
+        mkinitcpio -P 2>/dev/null || true
     fi
-done
-if command -v mkinitcpio &>/dev/null && ! command -v update-initramfs &>/dev/null && ! command -v dracut &>/dev/null; then
-    mkinitcpio -P 2>/dev/null || true
+    ok "depmod and initramfs refresh attempted"
+else
+    warn "No patched kernel modules found"
 fi
-ok "initramfs rebuild attempted"
 
 for gsp in /lib/firmware/nvidia/*/gsp_tu10x.bin; do
     rm -f \
