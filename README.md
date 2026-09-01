@@ -51,10 +51,10 @@ Below are memory and performance results after applying the unlock:
 - Linux (x86-64)
 - Root access
 - NVIDIA CMP 170HX
-- **nvidia-open 610.xx.xx+ already installed** (libs + firmware)
+- **nvidia-open-dkms 610.xx.xx+ already installed** (libs + firmware)
+- **dkms** (kernel module build framework)
 - Kernel headers matching the running kernel (`linux-headers-$(uname -r)` / `kernel-devel`)
 - Secure Boot disabled (patched modules are unsigned)
-- Network access on first install (downloads matching stock `open-gpu-kernel-modules` sources)
 - Python 3 (used at build time to select 8GB/10GB geometry)
 
 ---

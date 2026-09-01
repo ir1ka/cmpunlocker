@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="$(uname -r)"
-INSTALL_MOD_DIR="/lib/modules/${KVER}/updates/cmpunlocker"
-INVENTORY_FILE="${INSTALL_MOD_DIR}/gpu_inventory"
+CMPUNLOCKER_DIR="/var/cmpunlocker"
+INVENTORY_FILE="${CMPUNLOCKER_DIR}/gpu_inventory"
 
 source "${SCRIPT_DIR}/common/lib.sh"
 
@@ -124,8 +124,8 @@ else
 fi
 
 echo ""
-if [[ -r "${INSTALL_MOD_DIR}/card_profile" ]]; then
-    info "Installed profile: $(cat "${INSTALL_MOD_DIR}/card_profile") / geometry: $(cat "${INSTALL_MOD_DIR}/unlock_geometry" 2>/dev/null || echo '?')"
+if [[ -r "${CMPUNLOCKER_DIR}/card_profile" ]]; then
+    info "Installed profile: $(cat "${CMPUNLOCKER_DIR}/card_profile") / geometry: $(cat "${CMPUNLOCKER_DIR}/unlock_geometry" 2>/dev/null || echo '?')"
 fi
 
 if (( failures > 0 )); then
