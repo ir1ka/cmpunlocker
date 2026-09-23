@@ -176,7 +176,7 @@ step "Verifying nvidia-open (${SUPPORTED_VERSIONS_CSV})"
 [[ ${#SUPPORTED_VERSIONS[@]} -gt 0 ]] || die "No supported versions listed in driver/VERSION"
 if [[ -d /sys/firmware/efi ]] && command -v mokutil &>/dev/null; then
     if mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
-        die "Secure Boot is enabled. Disable it before installing unsigned patched modules."
+        warn "Secure Boot is enabled. Disable it before installing unsigned patched modules."
     fi
 fi
 
